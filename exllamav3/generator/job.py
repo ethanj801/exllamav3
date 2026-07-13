@@ -60,6 +60,7 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        post_sampling_probs: bool = False,
         **kwargs
     ):
         """
@@ -98,14 +99,16 @@ class Job:
             If False, special tokens will still be respected as stop conditions.
 
         :param return_top_tokens:
-            Number of top tokens to return, along with their final sampling probabilities. There is some
-            performance penalty for enabling this.
+            Number of top tokens to return, along with their probabilities. By default the probabilities
+            are computed from a softmax over the raw logits, before any logit mask or sampler steps are
+            applied. Set post_sampling_probs to compute them from the sampled distribution instead. There
+            is some performance penalty for enabling this.
 
         :param return_logits:
             Return pre-sampling logits along with output tokens.
 
         :param return_probs:
-            Return final sampling probability for each chosen token.
+            Return the probability for each chosen token, from the same distribution as return_top_tokens.
 
         :param filters:
             List of Filters to apply during generation.
@@ -134,6 +137,13 @@ class Job:
 
         :param rq_state:
             Internal, passed when job requeues itself
+
+        :param post_sampling_probs:
+            Compute the probabilities for return_top_tokens and return_probs from the sampled
+            distribution, after the logit mask and the sampler's distribution steps, instead of from a
+            softmax over the raw logits. Tokens removed by truncation samplers or a logit mask then have
+            probability zero. Requires a sampler whose forward supports return_processed_probs, which
+            includes CustomSampler and every sampler derived from it.
 
         :param kwargs:
         """
@@ -208,6 +218,7 @@ class Job:
         self.return_top_tokens = return_top_tokens
         self.return_logits = return_logits
         self.return_probs = return_probs
+        self.post_sampling_probs = post_sampling_probs
 
         # Stop conditions
         self.stop_strings = rq_state.get("stop_strings", set())
@@ -428,18 +439,31 @@ class Job:
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
 
-        next_token = self.sampler.forward(
-            logits,
-            self.current_pinned_ids,
-            self.rng.randint(0, (1<<32)-1),
-            self.generator.tokenizer,
-            logit_mask = self.device_logit_mask
-        )
+        probs = None
+
+        if self.post_sampling_probs and (self.return_probs or self.return_top_tokens > 0):
+            next_token, probs = self.sampler.forward(
+                logits,
+                self.current_pinned_ids,
+                self.rng.randint(0, (1<<32)-1),
+                self.generator.tokenizer,
+                logit_mask = self.device_logit_mask,
+                return_processed_probs = True
+            )
+        else:
+            next_token = self.sampler.forward(
+                logits,
+                self.current_pinned_ids,
+                self.rng.randint(0, (1<<32)-1),
+                self.generator.tokenizer,
+                logit_mask = self.device_logit_mask
+            )
 
         next_prob, next_k_tokens, next_k_probs = None, None, None
 
         if self.return_probs or self.return_top_tokens > 0:
-            probs = torch.softmax(logits.float(), dim = -1)
+            if probs is None:
+                probs = torch.softmax(logits.float(), dim = -1)
 
             if self.return_probs:
                 next_prob = torch.gather(probs.squeeze(0), dim = 1, index = next_token)
@@ -858,6 +882,7 @@ class Job:
             return_top_tokens = self.return_top_tokens,
             return_logits = self.return_logits,
             return_probs = self.return_probs,
+            post_sampling_probs = self.post_sampling_probs,
             filters = self.filters,  # Carries over state
             token_healing = False,  # Token healed on first round
             identifier = self.identifier,

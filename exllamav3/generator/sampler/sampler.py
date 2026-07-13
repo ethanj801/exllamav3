@@ -16,6 +16,7 @@ class Sampler:
         tokenizer: Tokenizer | None = None,
         blocked_tokens: list[int] | None = None,
         allowed_tokens: list[int] | None = None,
-        return_state: bool = False
+        return_state: bool = False,
+        return_processed_probs: bool = False
     ):
         pass

@@ -54,6 +54,31 @@ class SamplingState:
             return self.logits
         return torch.empty((self.bsz, self.dim), dtype = torch.float, device = self.in_logits.device)
 
+    def vocab_probs(self):
+        """
+        Compute the distribution currently described by the state, as normalized probabilities over the
+        full vocabulary, shape (bsz, dim). Tokens removed by truncation steps have probability zero.
+        """
+        compact = None
+        match self.state:
+            case SS.INIT:
+                return torch.softmax(self.in_logits.float(), dim = -1)
+            case SS.LOGITS:
+                return torch.softmax(self.logits.float(), dim = -1)
+            case SS.LOGITS_S:
+                compact = torch.softmax(self.logits.float(), dim = -1)
+            case SS.PROBS | SS.PROBS_N:
+                probs = self.probs.float()
+                return probs / probs.sum(dim = -1, keepdim = True)
+            case SS.PROBS_S | SS.PROBS_N_S:
+                compact = self.probs.float()
+                compact = compact / compact.sum(dim = -1, keepdim = True)
+            case _:
+                raise ValueError("Sampling logic error")
+        full = torch.zeros((self.bsz, self.dim), dtype = torch.float, device = self.in_logits.device)
+        full.scatter_(-1, self.indices, compact)
+        return full
+
 
 class SS_Base:
     def run(self, state: SamplingState):
@@ -564,8 +589,16 @@ class CustomSampler(Sampler):
         rand_u32: int | None = None,
         tokenizer: Tokenizer | None = None,
         logit_mask: torch.Tensor | None = None,
-        return_state: bool = False
+        return_state: bool = False,
+        return_processed_probs: bool = False
     ):
+        """
+        If return_processed_probs is set, also return the normalized distribution over the full
+        vocabulary as it stands after the logit mask and every distribution step, captured just before
+        the final sampling step.
+        A fused step that transforms and samples in one pass, such as SS_AdaptiveP, is not reflected in
+        the captured distribution. Ignored when return_state is set.
+        """
         out_shape = logits.shape[:-1]
 
         if tokenizer is not None:
@@ -596,9 +629,18 @@ class CustomSampler(Sampler):
             past_ids = sequence_ids,
         )
 
-        for ss in self.steps:
+        processed_probs = None
+        last_step = len(self.steps) - 1
+        for i, ss in enumerate(self.steps):
             assert state.state != SS.DONE, "Sampling logic error"
+            if return_processed_probs and not return_state and i == last_step:
+                processed_probs = state.vocab_probs()
             ss.run(state)
         assert return_state or state.state == SS.DONE, "Sampling logic error"
 
-        return state if return_state else state.sample.view(out_shape)
+        if return_state:
+            return state
+        sample = state.sample.view(out_shape)
+        if return_processed_probs:
+            return sample, processed_probs.view(*out_shape, state.dim)
+        return sample
